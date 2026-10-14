@@ -1,0 +1,89 @@
+name: Build Vocal Compressor (64-bit + 32-bit) and release
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_NAME: "Vocal Compressor"
+  CMAKE_TARGET: VocalCompressor_VST3
+  ARTEFACTS: VocalCompressor_artefacts
+  FILE_BASE: Vocal-Compressor
+  OLD_NAME: ""
+
+jobs:
+  build:
+    name: ${{ matrix.bits }}-bit
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { bits: "64", arch: x64,   guid: "658B6F17-9845-421D-B8ED-98C4162A9A1E" }
+          - { bits: "32", arch: Win32, guid: "C3E4BF0C-B102-4E2A-B302-0CBF865DDF72" }
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure (MSVC ${{ matrix.arch }})
+        run: cmake -S . -B build -A ${{ matrix.arch }}
+
+      - name: Build plugin
+        run: cmake --build build --config Release --target ${{ env.CMAKE_TARGET }} --parallel
+
+      - name: Build ${{ matrix.bits }}-bit setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $ws = $env:GITHUB_WORKSPACE
+          $a = @(
+            "/DAppName=$env:PLUGIN_NAME",
+            "/DArch=${{ matrix.bits }}",
+            "/DAppIdGuid=${{ matrix.guid }}",
+            "/DArtDir=$ws\Installer",
+            "/DPluginDir=$ws\build\$env:ARTEFACTS\Release\VST3\$env:PLUGIN_NAME.vst3",
+            "/DOutName=$env:FILE_BASE-Setup-${{ matrix.bits }}bit",
+            "/O$ws\out"
+          )
+          if ($env:OLD_NAME -ne "") { $a += "/DOldName=$env:OLD_NAME" }
+          & $iscc @a "Installer\setup.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: setup-${{ matrix.bits }}bit
+          path: out/*.exe
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -la out
+          for t in $(gh release list --json tagName -q '.[].tagName'); do gh release delete "$t" --yes --cleanup-tag || true; done
+          cat > notes.md <<NOTES
+          ## ${PLUGIN_NAME} by ROHIT JI - VST3 for Windows
+
+          | Download | Use it for |
+          |---|---|
+          | **${FILE_BASE}-Setup-64bit.exe** | 64-bit FL Studio, Cubase and other modern DAWs (most people need this one) |
+          | **${FILE_BASE}-Setup-32bit.exe** | Older 32-bit DAWs only |
+
+          Run the setup and click **Next > Install > Finish**. Then rescan plugins in your DAW.
+          NOTES
+          sed -i 's/^          //' notes.md
+          gh release create v1.0.0 out/${FILE_BASE}-Setup-64bit.exe out/${FILE_BASE}-Setup-32bit.exe \
+            --title "${PLUGIN_NAME} v1.0.0 (64-bit + 32-bit)" --notes-file notes.md --latest
